@@ -31,7 +31,8 @@ const home = `
   <p class="note">架空データ専用・実決済なし。試し注文は開いている画面のメモリー内で動きます。</p>
   <p class="note">公開ディレクトリへの掲載は準備中です。接続権限がある方はChatGPTで開けます。</p>
   <div class="public-actions">
-    <a class="primary-link" href="${pluginUrl}">ChatGPTでプラグインを開く</a>
+    <a class="primary-link" href="/order">ブラウザーで試し注文</a>
+    <a href="${pluginUrl}">ChatGPTでプラグインを開く</a>
     <a href="/example.csv" download="example.csv">架空の注文CSVをダウンロード</a>
   </div>
 </header>
@@ -67,6 +68,7 @@ const support = `
 </header>
 <section class="public-section" aria-labelledby="operation-title">
   <h2 id="operation-title">基本操作</h2>
+  <p>ブラウザーだけで試す場合は、<a href="/order">試し注文の画面</a>を開いてください。ChatGPTのPlugin画面とは別に動く、ブラウザー内の架空データです。</p>
   <ol>
     <li><a href="${pluginUrl}">ChatGPTのプラグイン</a>を開き、接続の案内を確認します。</li>
     <li>商品・在庫・受取枠を会話で確認し、専用画面を開きます。</li>

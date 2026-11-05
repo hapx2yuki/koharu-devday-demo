@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
+import { createHash, webcrypto } from 'node:crypto';
 import { build } from 'esbuild';
 import { OpenAIFileEntrypointInputSchema } from '@openai/mcp-extensions/app';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -15,6 +16,7 @@ import type { MissionOrdersSnapshot } from '../src/order-types.js';
 
 class TestElement {
   children: TestElement[] = [];
+  dataset: Record<string, string> = {};
   id = '';
   textContent: string | null = '';
   constructor(readonly tagName: string) {}
@@ -40,8 +42,9 @@ const appBundle = build({
       : 'export const OpenAIExtensions = testHost.OpenAIExtensions; export const OpenAIFileEntrypointInputSchema = testHost.fileInputSchema;' }));
   } }],
 }).then(result => result.outputFiles[0]!.text);
-async function setupApp() {
+async function setupApp(browser = false) {
   const root = new TestElement('main'); root.id = 'app';
+  if (browser) root.dataset.surface = 'browser';
   const connection = deferred<void>();
   const snapshotRequested = deferred<void>();
   const initialSnapshot = deferred<unknown>();
@@ -49,13 +52,14 @@ async function setupApp() {
   const fileContents = deferred<unknown>();
   const handlers = new Map<string, (event: unknown) => Promise<void>>();
   let app!: TestApp;
+  let connectionCalls = 0, serverCalls = 0;
   class TestApp {
     ontoolresult?: (result: { structuredContent: unknown }) => Promise<void>;
     constructor() { app = this; }
     addEventListener(type: string, handler: (event: unknown) => Promise<void>) { handlers.set(type, handler); }
-    connect() { return connection.promise; }
+    connect() { connectionCalls++; return connection.promise; }
     getHostContext() { return {}; }
-    callServerTool() { snapshotRequested.resolve(); return initialSnapshot.promise; }
+    callServerTool() { serverCalls++; snapshotRequested.resolve(); return initialSnapshot.promise; }
   }
   class TestExtensions {
     resources = { read: () => { fileRequested.resolve(); return fileContents.promise; } };
@@ -64,10 +68,11 @@ async function setupApp() {
   const boot = runInNewContext(`(async () => { ${await appBundle} })()`, {
     testHost: { App: TestApp, OpenAIExtensions: TestExtensions, fileInputSchema: OpenAIFileEntrypointInputSchema },
     document: { createElement: (tag: string) => new TestElement(tag), getElementById: (id: string) => root.find(id) },
-    TextDecoder, atob,
+    TextDecoder, atob, structuredClone, crypto: webcrypto,
   }) as Promise<void>;
   return {
     root, connection, snapshotRequested, fileRequested, boot,
+    calls: () => ({connectionCalls, serverCalls}),
     openFile: () => handlers.get('toolinput')!({ arguments: { file: { name: 'example.csv', resourceUri: 'file://example.csv' } } }),
     finishFile: () => fileContents.resolve({ contents: [{ text: 'pickup_number,product_id,quantity,unit_price_yen,status\nK001,coffee,2,450,confirmed\n' }] }),
     finishSnapshot: () => initialSnapshot.resolve({ structuredContent: snapshot }),
@@ -86,6 +91,34 @@ test('ファイルが初期画面より先に読めても、集計結果を初�
   assert.match(ui.root.find('csv-result')!.textContent!, /example.csv\n1行を確認\n受付済み 2点 \/ ¥900/);
   await ui.renderAgain();
   assert.match(ui.root.find('csv-result')!.textContent!, /受付済み 2点 \/ ¥900/);
+});
+
+test('明示したブラウザー入口はMCP接続を始めず、同じ注文画面を表示する', async () => {
+  const ui = await setupApp(true); await ui.boot;
+  assert.deepEqual(ui.calls(), {connectionCalls: 0, serverCalls: 0});
+  assert.ok(ui.root.find('product'));
+  assert.ok(ui.root.find('amount'));
+  assert.ok(ui.root.find('slot'));
+  const text = (element: TestElement): string => [element.textContent, ...element.children.map(text)].join('\n');
+  assert.match(text(ui.root), /ブラウザー内で試す架空の注文サービス/);
+  assert.match(text(ui.root), /まだ試し注文はありません/);
+});
+
+test('公開の注文画面は同梱スクリプトだけを許可し、外部通信を許可しない', async () => {
+  const {default: worker} = await import(new URL('../dist/worker.js', import.meta.url).href);
+  const response = await worker.fetch(new Request('https://demo.example/order'));
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /data-surface="browser"/);
+  const script = /<script type="module">([\s\S]*?)<\/script>/.exec(html)?.[1];
+  assert.ok(script);
+  const expected = createHash('sha256').update(script).digest('base64');
+  assert.ok(response.headers.get('Content-Security-Policy')!.includes(`script-src 'sha256-${expected}'`));
+  assert.match(response.headers.get('Content-Security-Policy')!, /connect-src 'none'/);
+  const head = await worker.fetch(new Request('https://demo.example/order', {method: 'HEAD'}));
+  assert.equal(head.status, 200); assert.equal(await head.text(), '');
+  const post = await worker.fetch(new Request('https://demo.example/order', {method: 'POST'}));
+  assert.equal(post.status, 405);
 });
 test('初期画面の後にファイル読取が完了しても、集計結果を再描画で保持する', async () => {
   const ui = await setupApp();

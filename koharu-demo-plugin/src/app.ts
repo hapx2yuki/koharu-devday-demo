@@ -1,6 +1,6 @@
 import { App, applyDocumentTheme, applyHostStyleVariables } from '@modelcontextprotocol/ext-apps';
 import { OpenAIExtensions, OpenAIFileEntrypointInputSchema } from '@openai/mcp-extensions/app';
-import { MissionOrders, MissionOrdersError } from './orders.js';
+import { MissionOrders, MissionOrdersError, createKoharuOrderConfiguration } from './orders.js';
 import { MemoryStore } from './store.js';
 import { summarizeDemoCsv } from './csv.js';
 import type { MissionOrdersSnapshot } from './order-types.js';
@@ -37,7 +37,14 @@ async function accept(content: unknown): Promise<void> {
 function render(): void {
   if (!snapshot) return; root.replaceChildren();
   const header = node('header'); header.append(node('p', 'KOHARU COFFEE / DEMO', 'eyebrow'), node('h1', '注文から、受取まで。'));
-  header.append(node('p', mode === 'public-readonly' ? '公開サーバーは読取専用です。下の試し注文は、この画面のメモリー内だけで動きます。' : '架空の店舗を使ったローカルデモです。実決済・顧客への連絡はありません。', 'note')); root.append(header);
+  const note = mode === 'browser-demo'
+    ? 'ブラウザー内で試す架空の注文サービスです。実決済はなく、再読込すると最初の状態に戻ります。'
+    : mode === 'public-readonly' ? '公開サーバーは読取専用です。下の試し注文は、この画面のメモリー内だけで動きます。' : '架空の店舗を使ったローカルデモです。実決済・顧客への連絡はありません。';
+  header.append(node('p', note, 'note'));
+  if (mode === 'browser-demo') {
+    const back = node('a', 'デモの説明へ戻る'); back.href = '/'; header.append(back);
+  }
+  root.append(header);
   const stats = node('div', undefined, 'stats');
   for (const [label, value] of [['受付中', snapshot.confirmedOrderCount + '件'], ['注文合計', '¥' + snapshot.confirmedTotalYen.toLocaleString('ja-JP')], ['在庫合計', snapshot.products.reduce((n,p) => n + p.availableStock, 0) + '点']]) {
     const card = node('section'); card.append(node('span', label), node('strong', value)); stats.append(card);
@@ -104,5 +111,12 @@ async function readOpenedFile(): Promise<void> {
 app.addEventListener('toolinput', async ({ arguments: args }) => { const parsed = OpenAIFileEntrypointInputSchema.safeParse(args); if (parsed.success) { fileInput = parsed.data; await readOpenedFile(); } });
 app.ontoolresult = async result => { await accept(result.structuredContent); await readOpenedFile(); };
 app.addEventListener('hostcontextchanged', context => { if (context.theme) applyDocumentTheme(context.theme); if (context.styles?.variables) applyHostStyleVariables(context.styles.variables); });
-try { await app.connect(); connected = true; const context = app.getHostContext(); if (context?.theme) applyDocumentTheme(context.theme); if (context?.styles?.variables) applyHostStyleVariables(context.styles.variables); await readOpenedFile(); if (!snapshot) await call('koharu_snapshot'); }
-catch { root.replaceChildren(node('h1', '接続を確認できませんでした'), node('p', 'この画面はChatGPTのMCP Appとして開いてください。架空注文のサーバーは起動していません。')); }
+if (root.dataset?.surface === 'browser') {
+  mode = 'browser-demo';
+  preview = new MissionOrders(new MemoryStore(), 'koharu_browser_demo');
+  await preview.initialize({requestId: 'initialize_browser', ...createKoharuOrderConfiguration()});
+  snapshot = await preview.snapshot(); render();
+} else {
+  try { await app.connect(); connected = true; const context = app.getHostContext(); if (context?.theme) applyDocumentTheme(context.theme); if (context?.styles?.variables) applyHostStyleVariables(context.styles.variables); await readOpenedFile(); if (!snapshot) await call('koharu_snapshot'); }
+  catch { root.replaceChildren(node('h1', '接続を確認できませんでした'), node('p', 'この画面はChatGPTのMCP Appとして開いてください。架空注文のサーバーは起動していません。')); }
+}

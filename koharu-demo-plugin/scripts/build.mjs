@@ -1,5 +1,6 @@
 import { build } from 'esbuild';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 await mkdir('dist', { recursive: true });
 const ui = await build({ entryPoints: ['src/app.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2023', write: false, minify: true });
 const script = ui.outputFiles[0].text.replaceAll('</script', '<\\/script');
@@ -17,5 +18,8 @@ for (const [family, weight, file] of [
   const encoded = (await readFile('assets/fonts/' + file)).toString('base64');
   publicCss += `@font-face{font-family:"${family}";font-style:normal;font-weight:${weight};font-display:swap;src:url(data:font/ttf;base64,${encoded})format("truetype")}\n`;
 }
-await build({ entryPoints: ['src/public-worker.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2023', outfile: 'dist/worker.js', define: { KOHARU_UI_HTML: JSON.stringify(html), KOHARU_PUBLIC_CSS: JSON.stringify(publicCss) } });
+const browserHtml = '<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>試し注文 | こはる珈琲</title><style>' + publicCss + ':root{font-family:"M PLUS 2",sans-serif;font-synthesis:none}pre{font-family:"M PLUS 1 Code",monospace}a{color:inherit;text-underline-offset:4px}</style></head><body><main id="app" data-surface="browser"><h1>こはる珈琲の試し注文</h1><p>画面を準備しています。</p></main><noscript>試し注文にはJavaScriptを有効にしてください。</noscript><script type="module">' + script + '</script></body></html>';
+const browserPage = {html: browserHtml, scriptHash: createHash('sha256').update(script).digest('base64')};
+await writeFile('dist/order.html', browserHtml);
+await build({ entryPoints: ['src/public-worker.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2023', outfile: 'dist/worker.js', define: { KOHARU_UI_HTML: JSON.stringify(html), KOHARU_PUBLIC_CSS: JSON.stringify(publicCss), KOHARU_BROWSER_PAGE: JSON.stringify(browserPage) } });
 console.log('MCPサーバー、公式MCP App、公開読取専用Workerを生成しました。');
