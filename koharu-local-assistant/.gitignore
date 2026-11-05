@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.env*
+coverage/
+dist/
+.local/
+credentials*
+tokens*

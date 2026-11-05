@@ -1,0 +1,11 @@
+import { build } from 'esbuild';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+await mkdir('dist', { recursive: true });
+const ui = await build({ entryPoints: ['src/app.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2023', write: false, minify: true });
+const script = ui.outputFiles[0].text.replaceAll('</script', '<\\/script');
+const css = await readFile('src/ui.css', 'utf8');
+const html = '<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>こはる珈琲 デモ</title><style>' + css + '</style><main id="app"><h1>こはる珈琲 デモ</h1><p>接続を確認しています。</p></main><script type="module">' + script + '</script></html>';
+await writeFile('dist/ui.html', html);
+await build({ entryPoints: ['src/stdio.ts'], bundle: true, format: 'esm', platform: 'node', target: 'node22', outfile: 'dist/server.mjs', packages: 'bundle' });
+await build({ entryPoints: ['src/public-worker.ts'], bundle: true, format: 'esm', platform: 'browser', target: 'es2023', outfile: 'dist/worker.js', define: { KOHARU_UI_HTML: JSON.stringify(html) } });
+console.log('MCPサーバー、公式MCP App、公開読取専用Workerを生成しました。');

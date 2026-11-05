@@ -1,0 +1,4 @@
+pickup_number,product_id,quantity,unit_price_yen,status
+K001,coffee,2,450,confirmed
+K001,latte,1,550,confirmed
+K002,baked-sweets,1,320,cancelled

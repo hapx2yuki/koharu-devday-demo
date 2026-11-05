@@ -1,0 +1,15 @@
+{
+  "name": "koharu-local-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "架空のこはる珈琲デモで使う、ローカル専用のChatGPT認証補助アプリ",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "tsx src/cli.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": { "jose": "6.2.15" },
+  "devDependencies": { "@types/node": "^24.0.0", "tsx": "4.23.15", "typescript": "7.0.2" }
+}

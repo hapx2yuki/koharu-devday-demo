@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "koharu-demo",
+  "version": "0.1.0",
+  "description": "架空のこはる珈琲で、商品・在庫・受取枠を確認し、試し注文と取消、注文CSVの確認を行います。実決済や顧客送信はありません。",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "interface": {
+        "displayName": "こはる珈琲 デモ",
+        "shortDescription": "架空の注文と在庫を、その場で確かめる"
+      }
+    }
+  }
+}

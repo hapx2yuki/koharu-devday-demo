@@ -1,0 +1,34 @@
+{
+  "name": "koharu-demo-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "架空の珈琲店の注文・在庫・受取枠を体験するローカルMCP Plugin",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/server.mjs",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "audit:package": "node scripts/audit.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@modelcontextprotocol/server": "2.3.0",
+    "@openai/mcp-extensions": "0.2.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "zod": "4.6.7"
+  }
+}
