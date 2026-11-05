@@ -1,5 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
+import { OpenAIFileEntrypointInputSchema } from '@openai/mcp-extensions/app';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -7,6 +11,91 @@ import { createDemoServer, UI_URI } from '../src/server.js';
 import { handlePublicMcp } from '../src/public-worker.js';
 import { summarizeDemoCsv } from '../src/csv.js';
 import type { MissionOrdersSnapshot } from '../src/order-types.js';
+
+class TestElement {
+  children: TestElement[] = [];
+  id = '';
+  textContent: string | null = '';
+  constructor(readonly tagName: string) {}
+  append(...children: TestElement[]) { this.children.push(...children); }
+  replaceChildren(...children: TestElement[]) { this.children = children; }
+  setAttribute() {}
+  find(id: string): TestElement | undefined {
+    return this.id === id ? this : this.children.map(child => child.find(id)).find(Boolean);
+  }
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+const appBundle = build({
+  entryPoints: [fileURLToPath(new URL('../src/app.ts', import.meta.url))], bundle: true,
+  format: 'esm', platform: 'browser', write: false,
+  plugins: [{ name: 'test-host', setup(builder) {
+    builder.onResolve({ filter: /^(@modelcontextprotocol\/ext-apps|@openai\/mcp-extensions\/app)$/ }, args => ({ path: args.path, namespace: 'test-host' }));
+    builder.onLoad({ filter: /.*/, namespace: 'test-host' }, args => ({ contents: args.path === '@modelcontextprotocol/ext-apps'
+      ? 'export const App = testHost.App; export const applyDocumentTheme = () => {}; export const applyHostStyleVariables = () => {};'
+      : 'export const OpenAIExtensions = testHost.OpenAIExtensions; export const OpenAIFileEntrypointInputSchema = testHost.fileInputSchema;' }));
+  } }],
+}).then(result => result.outputFiles[0]!.text);
+async function setupApp() {
+  const root = new TestElement('main'); root.id = 'app';
+  const connection = deferred<void>();
+  const snapshotRequested = deferred<void>();
+  const initialSnapshot = deferred<unknown>();
+  const fileRequested = deferred<void>();
+  const fileContents = deferred<unknown>();
+  const handlers = new Map<string, (event: unknown) => Promise<void>>();
+  let app!: TestApp;
+  class TestApp {
+    ontoolresult?: (result: { structuredContent: unknown }) => Promise<void>;
+    constructor() { app = this; }
+    addEventListener(type: string, handler: (event: unknown) => Promise<void>) { handlers.set(type, handler); }
+    connect() { return connection.promise; }
+    getHostContext() { return {}; }
+    callServerTool() { snapshotRequested.resolve(); return initialSnapshot.promise; }
+  }
+  class TestExtensions {
+    resources = { read: () => { fileRequested.resolve(); return fileContents.promise; } };
+  }
+  const snapshot = { mode: 'local-demo', snapshot: { products: [], slots: [], orders: [], confirmedOrderCount: 0, confirmedTotalYen: 0 } };
+  const boot = runInNewContext(`(async () => { ${await appBundle} })()`, {
+    testHost: { App: TestApp, OpenAIExtensions: TestExtensions, fileInputSchema: OpenAIFileEntrypointInputSchema },
+    document: { createElement: (tag: string) => new TestElement(tag), getElementById: (id: string) => root.find(id) },
+    TextDecoder, atob,
+  }) as Promise<void>;
+  return {
+    root, connection, snapshotRequested, fileRequested, boot,
+    openFile: () => handlers.get('toolinput')!({ arguments: { file: { name: 'example.csv', resourceUri: 'file://example.csv' } } }),
+    finishFile: () => fileContents.resolve({ contents: [{ text: 'pickup_number,product_id,quantity,unit_price_yen,status\nK001,coffee,2,450,confirmed\n' }] }),
+    finishSnapshot: () => initialSnapshot.resolve({ structuredContent: snapshot }),
+    renderAgain: () => app.ontoolresult!({ structuredContent: snapshot }),
+  };
+}
+
+test('ファイルが初期画面より先に読めても、集計結果を初期表示と再描画で保持する', async () => {
+  const ui = await setupApp();
+  await ui.openFile();
+  ui.connection.resolve();
+  await ui.fileRequested.promise;
+  ui.finishFile();
+  await ui.snapshotRequested.promise;
+  ui.finishSnapshot(); await ui.boot;
+  assert.match(ui.root.find('csv-result')!.textContent!, /example.csv\n1行を確認\n受付済み 2点 \/ ¥900/);
+  await ui.renderAgain();
+  assert.match(ui.root.find('csv-result')!.textContent!, /受付済み 2点 \/ ¥900/);
+});
+test('初期画面の後にファイル読取が完了しても、集計結果を再描画で保持する', async () => {
+  const ui = await setupApp();
+  ui.connection.resolve(); await ui.snapshotRequested.promise;
+  const opening = ui.openFile(); await ui.fileRequested.promise;
+  ui.finishSnapshot(); await ui.boot;
+  ui.finishFile(); await opening;
+  assert.match(ui.root.find('csv-result')!.textContent!, /受付済み 2点 \/ ¥900/);
+  await ui.renderAgain();
+  assert.match(ui.root.find('csv-result')!.textContent!, /example.csv\n1行を確認\n受付済み 2点 \/ ¥900/);
+});
 
 async function setup(mode: 'local-demo' | 'public-readonly' = 'local-demo') {
   const server = createDemoServer('<!doctype html><p>架空データ</p>', mode);
