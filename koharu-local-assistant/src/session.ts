@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { KeychainStore, hostConfig, saveHost } from './keychain.js';
-import { SafeError, authorizationUrl, consumeCallback, createPending, exchangeCode, RESOURCE, TOKEN, ISSUER, type Credential, type PendingAuth } from './protocol.js';
+import { SafeError, authorizationUrl, consumeCallback, beginPending, exchangeCode, RESOURCE, TOKEN, ISSUER, type Credential, type PendingAuth } from './protocol.js';
 
 function openBrowser(url: string): void {
   // URL is loopback only, with no credentials or authorization parameters.
@@ -10,12 +10,36 @@ function openBrowser(url: string): void {
 }
 const html = (body: string) => `<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>こはる珈琲 補助アプリ</title><body><main><h1>こはる珈琲 補助アプリ</h1>${body}</main></body></html>`;
 
-export async function signIn(plan: boolean, addAccount = false): Promise<void> {
-  const config = await hostConfig(); const store = new KeychainStore();
+export interface SignInDependencies {
+  readHost?: typeof hostConfig;
+  writeHost?: typeof saveHost;
+  saveCredential?: (credential: Credential) => Promise<void>;
+  exchange?: (pending: PendingAuth, callback: {clientId: string; code: string}, signal: AbortSignal) => Promise<Credential>;
+  openBrowser?: (url: string) => void;
+  signals?: {
+    once(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+    removeListener(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  };
+}
+export async function signIn(plan: boolean, addAccount = false, dependencies: SignInDependencies = {}): Promise<void> {
+  const config = await (dependencies.readHost ?? hostConfig)(); const store = new KeychainStore();
+  const saveCredential = dependencies.saveCredential ?? ((credential: Credential) => store.save(credential));
+  const writeHost = dependencies.writeHost ?? saveHost;
+  const exchange = dependencies.exchange ?? ((pending, callback, signal) => exchangeCode(pending, callback, fetch, undefined, signal));
+  const signals = dependencies.signals ?? process;
   const previous = !addAccount && config.active ? config.accounts.find(a => a.clientId === config.active) : undefined;
-  let pending: PendingAuth; let settled = false;
+  let pending: PendingAuth | undefined; let settled = false;
+  let activeCallback: Promise<void> | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const cancellation = new AbortController();
   let done!: () => void; let fail!: (e: Error) => void;
   const completion = new Promise<void>((resolve, reject) => { done = resolve; fail = reject; });
+  const stop = (error: Error) => {
+    if (settled) return;
+    settled = true;
+    cancellation.abort();
+    fail(error);
+  };
   const server = createServer(async (req, res) => {
     const port = (server.address() as { port: number }).port;
     const host = `127.0.0.1:${port}`;
@@ -23,35 +47,68 @@ export async function signIn(plan: boolean, addAccount = false): Promise<void> {
     res.setHeader('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Content-Type', 'text/html; charset=utf-8');
     if (req.method !== 'GET' || req.headers.host !== host || !req.url || req.url.length > 8192) { res.writeHead(400).end(html('<p>要求を受け付けられません。</p>')); return; }
-    const url = new URL(req.url, `http://${host}`);
+    let url: URL;
+    try { url = new URL(req.url, `http://${host}`); }
+    catch { res.writeHead(400).end(); return; }
     if (url.pathname === '/') {
       res.end(html(`<p>このMacのキーチェーンにだけ認証を保存します。工房やWebサーバーには渡しません。</p><p><a href="/start">Continue with ChatGPT</a></p><p>${plan ? '本人認証とChatGPTプラン利用の許可を確認します。' : '今回は本人認証だけを行います。'}</p>`)); return;
     }
-    if (url.pathname === '/start' && !pending.consumed) {
+    if (url.pathname === '/start' && !settled) {
+      if (activeCallback) { res.writeHead(409).end(html('<p>認証を確認中です。そのままお待ちください。</p>')); return; }
+      pending = beginPending(pending, port, config.hostId, previous);
+      clearTimeout(timeout);
+      timeout = setTimeout(() => stop(new SafeError('認証の開始から5分が経過しました。再度ログインしてください。')), Math.max(0, pending.expiresAt - Date.now()));
       res.writeHead(302, { Location: authorizationUrl(pending, plan) }).end(); return;
     }
     if (url.pathname !== '/auth/callback' || settled) { res.writeHead(404).end(); return; }
+    if (!pending) { res.writeHead(400).end(html('<p>最初の画面から認証を開始してください。</p>')); return; }
+    if (activeCallback) { res.writeHead(409).end(html('<p>認証を確認中です。そのままお待ちください。</p>')); return; }
+    const current = pending;
+    let callback: {clientId: string; code: string};
     try {
-      const callback = consumeCallback(pending, url);
-      const credential = await exchangeCode(pending, callback);
-      await store.save(credential);
-      if (!config.accounts.some(a => a.clientId === credential.clientId)) config.accounts.push({ clientId: credential.clientId, subject: credential.subject });
-      config.active = credential.clientId; await saveHost(config);
-      settled = true; res.end(html('<p>認証を保存しました。この画面を閉じて補助アプリへ戻れます。</p>')); done();
+      callback = consumeCallback(current, url);
     } catch (e) {
       res.writeHead(400).end(html('<p>認証を確認できませんでした。補助アプリからやり直してください。</p>'));
-      if (pending.consumed) { settled = true; fail(e instanceof SafeError ? e : new SafeError('認証処理に失敗しました。')); }
+      if (current.consumed) stop(e instanceof SafeError ? e : new SafeError('認証処理に失敗しました。'));
+      return;
     }
+    clearTimeout(timeout);
+    activeCallback = (async () => {
+      try {
+        const credential = await exchange(current, callback, cancellation.signal);
+        if (settled || cancellation.signal.aborted || pending !== current) {
+          res.writeHead(400).end(html('<p>認証待機は終了しました。</p>')); return;
+        }
+        // Once persistence starts, finish both writes before releasing the process lock.
+        await saveCredential(credential);
+        if (!config.accounts.some(a => a.clientId === credential.clientId)) config.accounts.push({ clientId: credential.clientId, subject: credential.subject });
+        config.active = credential.clientId; await writeHost(config);
+        res.end(html('<p>認証を保存しました。この画面を閉じて補助アプリへ戻れます。</p>'));
+        if (!settled) { settled = true; done(); }
+      } catch (e) {
+        res.writeHead(400).end(html('<p>認証を確認できませんでした。補助アプリからやり直してください。</p>'));
+        stop(e instanceof SafeError ? e : new SafeError('認証処理に失敗しました。'));
+      }
+    })();
+    await activeCallback;
   });
   server.requestTimeout = 10_000; server.headersTimeout = 10_000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const port = (server.address() as { port: number }).port;
-  pending = createPending(port, config.hostId, previous);
   console.log(`認証画面: http://127.0.0.1:${port}/`);
-  openBrowser(`http://127.0.0.1:${port}/`);
-  const timeout = setTimeout(() => fail(new SafeError('5分以内に認証が完了しませんでした。再度ログインしてください。')), 300_000);
+  (dependencies.openBrowser ?? openBrowser)(`http://127.0.0.1:${port}/`);
+  const interrupted = () => stop(new SafeError('認証待機を終了しました。'));
+  signals.once('SIGINT', interrupted); signals.once('SIGTERM', interrupted);
   try { await completion; console.log('ChatGPTの本人確認を完了しました。推論はまだ実行していません。'); }
-  finally { clearTimeout(timeout); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }
+  finally {
+    settled = true; cancellation.abort(); clearTimeout(timeout);
+    const closed = new Promise<void>(resolve => server.close(() => resolve()));
+    try { await activeCallback; }
+    finally {
+      server.closeAllConnections(); await closed;
+      signals.removeListener('SIGINT', interrupted); signals.removeListener('SIGTERM', interrupted);
+    }
+  }
 }
 
 export async function selectedCredential(store: KeychainStore): Promise<Credential> {

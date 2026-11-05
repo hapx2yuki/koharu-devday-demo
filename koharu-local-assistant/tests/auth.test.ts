@@ -1,14 +1,114 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { SignJWT, generateKeyPair, exportJWK, createLocalJWKSet } from 'jose';
-import { authorizationUrl, consumeCallback, createPending, exchangeCode, validateTokens, PLAN_SCOPES, ISSUER, type Credential } from '../src/protocol.js';
+import { authorizationUrl, consumeCallback, createPending, beginPending, exchangeCode, validateTokens, PLAN_SCOPES, ISSUER, type Credential } from '../src/protocol.js';
 import { KeychainStore } from '../src/keychain.js';
 import { createSyntheticPlan } from '../src/requests.js';
+import { signIn, type SignInDependencies } from '../src/session.js';
 
 const host = 'urn:uuid:12345678-1234-4234-8234-123456789abc';
 const clientId = 'oaiapp_test_registration';
 const credential: Credential = { clientId, subject: 'synthetic-subject', issuer: ISSUER, idToken: 'test-id-token', accessToken: 'test-access-token', refreshToken: 'test-refresh-token', scopes: ['openid', ...PLAN_SCOPES], expiresAt: Date.now() + 3600_000, savedAt: new Date().toISOString() };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return {promise, resolve};
+}
+function localSignIn(overrides: Partial<SignInDependencies> = {}) {
+  const ready = deferred<string>(), signals = new EventEmitter();
+  const saved: Credential[] = [], hostWrites: string[] = [];
+  let finished = false;
+  const result = signIn(false, false, {
+    readHost: async () => ({schema: 1, hostId: host, accounts: []}),
+    saveCredential: async value => { saved.push(value); },
+    writeHost: async value => { hostWrites.push(value.active!); },
+    openBrowser: url => { ready.resolve(url); }, signals, ...overrides,
+  }).then(() => ({error: undefined}), (error: Error) => ({error})).finally(() => { finished = true; });
+  return {ready: ready.promise, signals, saved, hostWrites, result, finished: () => finished};
+}
+async function startCallback(origin: string) {
+  const response = await fetch(new URL('/start', origin), {redirect: 'manual'});
+  assert.equal(response.status, 302);
+  const state = new URL(response.headers.get('location')!).searchParams.get('state')!;
+  const url = new URL('/auth/callback', origin);
+  url.search = new URLSearchParams({state, code: 'synthetic-code', client_id: clientId}).toString();
+  return url;
+}
+
+test('開始前の案内ページは交換を始めず、SIGINTで閉じる', async () => {
+  let exchanges = 0;
+  const session = localSignIn({exchange: async () => { exchanges++; return credential; }});
+  const origin = await session.ready;
+  assert.equal((await fetch(origin)).status, 200);
+  session.signals.emit('SIGINT');
+  assert.match((await session.result).error!.message, /終了/);
+  assert.equal(exchanges, 0); assert.equal(session.saved.length, 0);
+});
+
+test('交換中に停止すると通信を中断し、callback終了まで待って保存を防ぐ', async () => {
+  const entered = deferred<AbortSignal>(), exchange = deferred<Credential>();
+  const session = localSignIn({exchange: async (_pending, _callback, signal) => { entered.resolve(signal); return exchange.promise; }});
+  const url = await startCallback(await session.ready);
+  const response = fetch(url);
+  const signal = await entered.promise;
+  session.signals.emit('SIGINT');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signal.aborted, true); assert.equal(session.finished(), false);
+  exchange.resolve(credential);
+  assert.equal((await response).status, 400);
+  assert.match((await session.result).error!.message, /終了/);
+  assert.equal(session.saved.length, 0); assert.equal(session.hostWrites.length, 0);
+});
+
+test('交換中の再開始と重複callbackを拒否し、元の認証を一度だけ保存する', async () => {
+  const entered = deferred<void>(), exchange = deferred<Credential>(); let exchanges = 0;
+  const session = localSignIn({exchange: async () => { exchanges++; entered.resolve(); return exchange.promise; }});
+  const origin = await session.ready, url = await startCallback(origin), response = fetch(url);
+  await entered.promise;
+  assert.equal((await fetch(new URL('/start', origin), {redirect: 'manual'})).status, 409);
+  assert.equal((await fetch(url)).status, 409);
+  exchange.resolve(credential);
+  assert.equal((await response).status, 200); assert.equal((await session.result).error, undefined);
+  assert.equal(exchanges, 1); assert.deepEqual(session.saved, [credential]); assert.deepEqual(session.hostWrites, [clientId]);
+});
+
+test('保存開始後の停止はキーチェーンと選択情報の保存完了まで待つ', async () => {
+  const entered = deferred<void>(), release = deferred<void>(), writes: string[] = [];
+  const session = localSignIn({exchange: async () => credential, saveCredential: async () => { writes.push('keychain-start'); entered.resolve(); await release.promise; writes.push('keychain-done'); }, writeHost: async value => { assert.equal(value.active, clientId); writes.push('host-done'); }});
+  const response = fetch(await startCallback(await session.ready));
+  await entered.promise; session.signals.emit('SIGTERM');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(session.finished(), false); assert.deepEqual(writes, ['keychain-start']);
+  release.resolve(); await response;
+  assert.match((await session.result).error!.message, /終了/);
+  assert.deepEqual(writes, ['keychain-start', 'keychain-done', 'host-done']);
+});
+
+test('案内ページを遅れて開いても認証を始めた時刻から5分間受け付ける', () => {
+  const clickedAt = 3_600_000;
+  const pending = beginPending(undefined, 12345, host, credential, clickedAt);
+  assert.equal(pending.expiresAt, clickedAt + 300_000);
+  assert.equal(pending.clientId, credential.clientId);
+  assert.equal(pending.subject, credential.subject);
+});
+
+test('認証中の二度押しでstateや期限を変更しない', () => {
+  const pending = beginPending(undefined, 12345, host, undefined, 1000);
+  assert.equal(beginPending(pending, 12345, host, undefined, 2000), pending);
+  assert.equal(pending.expiresAt, 301_000);
+});
+
+test('期限切れや処理済みの認証は新しいstateで始める', () => {
+  const pending = beginPending(undefined, 12345, host, undefined, 1000);
+  const expired = beginPending(pending, 12345, host, undefined, 301_000);
+  assert.notEqual(expired.state, pending.state);
+  assert.equal(expired.expiresAt, 601_000);
+  expired.consumed = true;
+  assert.notEqual(beginPending(expired, 12345, host, undefined, 302_000).state, expired.state);
+});
 
 test('初回登録はPKCE・state・nonce・固定hostを送り、credentialをURLに含めない', () => {
   const pending = createPending(12345, host);
@@ -79,6 +179,15 @@ test('コード交換は発行済client IDとPKCEを正規endpointへPOSTする'
     assert.ok(!b.has('client_secret')); return Response.json({ id_token: id, scope: 'openid' });
   };
   await exchangeCode(p, { clientId, code: 'synthetic' }, fetcher, key); assert.ok(called);
+});
+
+test('停止のAbortSignalをコード交換の通信へ渡す', async () => {
+  const controller = new AbortController(); controller.abort();
+  const fetcher: typeof fetch = async (_url, init) => {
+    assert.equal(init?.signal?.aborted, true);
+    throw new DOMException('Cancelled test request', 'AbortError');
+  };
+  await assert.rejects(exchangeCode(createPending(23456, host), {clientId, code: 'synthetic'}, fetcher, undefined, controller.signal), {name: 'AbortError'});
 });
 
 test('Keychainへの書込みはstdinだけに秘密を渡し、保存値を再読取する', async () => {

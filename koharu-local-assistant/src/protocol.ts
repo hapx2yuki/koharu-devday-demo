@@ -33,6 +33,11 @@ export function createPending(port: number, hostId: string, selected?: Pick<Cred
   if (selected && !validClientId(selected.clientId)) throw new SafeError('保存された登録情報が不正です。');
   return { state: opaque(), nonce: opaque(), verifier: opaque(), redirectUri: `http://127.0.0.1:${port}/auth/callback`, hostId, expiresAt: now + 300_000, consumed: false, ...(selected ? { clientId: selected.clientId, subject: selected.subject } : {}) };
 }
+/** Start the five-minute authorization window only when the person follows the sign-in link. */
+export function beginPending(previous: PendingAuth | undefined, port: number, hostId: string, selected?: Pick<Credential, 'clientId' | 'subject'>, now = Date.now()): PendingAuth {
+  if (previous && !previous.consumed && previous.expiresAt > now) return previous;
+  return createPending(port, hostId, selected, now);
+}
 export function authorizationUrl(pending: PendingAuth, plan: boolean): string {
   const url = new URL(AUTHORIZE);
   url.search = new URLSearchParams({
@@ -83,8 +88,9 @@ export async function validateTokens(body: unknown, pending: PendingAuth, client
   return { clientId, subject: payload.sub, issuer: ISSUER, idToken: t.id_token, scopes, expiresAt: Date.now() + expires * 1000, savedAt: new Date().toISOString(), ...(typeof t.access_token === 'string' ? { accessToken: t.access_token } : {}), ...(typeof t.refresh_token === 'string' ? { refreshToken: t.refresh_token } : {}) };
 }
 
-export async function exchangeCode(pending: PendingAuth, callback: { clientId: string; code: string }, fetcher: typeof fetch = fetch, key: JWTVerifyGetKey = keys): Promise<Credential> {
-  const response = await fetcher(TOKEN, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(20_000), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: callback.clientId, code: callback.code, code_verifier: pending.verifier, redirect_uri: pending.redirectUri, resource: RESOURCE }) });
+export async function exchangeCode(pending: PendingAuth, callback: { clientId: string; code: string }, fetcher: typeof fetch = fetch, key: JWTVerifyGetKey = keys, signal?: AbortSignal): Promise<Credential> {
+  const timeout = AbortSignal.timeout(20_000);
+  const response = await fetcher(TOKEN, { method: 'POST', redirect: 'error', signal: signal ? AbortSignal.any([timeout, signal]) : timeout, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: callback.clientId, code: callback.code, code_verifier: pending.verifier, redirect_uri: pending.redirectUri, resource: RESOURCE }) });
   if (!response.ok) throw new SafeError(`認証交換に失敗しました（HTTP ${response.status}）。もう一度ログインしてください。`);
   return validateTokens(await response.json(), pending, callback.clientId, key);
 }
