@@ -1,14 +1,33 @@
 import { McpServer, createMcpHandler } from '@modelcontextprotocol/server';
 import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/server/validators/cf-worker';
-import { registerDemoTools } from './server.js';
+import { registerDemoTools, SAMPLE_CSV } from './server.js';
+import { publicPage } from './public-pages.js';
 declare const KOHARU_UI_HTML: string;
+declare const KOHARU_PUBLIC_CSS: string;
+
+function publicResponse(request: Request, path: string, sharedCss: string): Response {
+  const headers = new Headers({ 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'public, max-age=300', 'Referrer-Policy': 'no-referrer' });
+  if (path !== '/' && path !== '/support' && path !== '/example.csv') return new Response(request.method === 'HEAD' ? null : 'ページが見つかりません。', { status: 404, headers });
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    headers.set('Allow', 'GET, HEAD');
+    return new Response('このページはGETまたはHEADで開いてください。', { status: 405, headers });
+  }
+  if (path === '/example.csv') {
+    headers.set('Content-Type', 'text/csv; charset=utf-8');
+    headers.set('Content-Disposition', 'attachment; filename="example.csv"');
+    return new Response(request.method === 'HEAD' ? null : SAMPLE_CSV, { headers });
+  }
+  headers.set('Content-Type', 'text/html; charset=utf-8');
+  headers.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+  return new Response(request.method === 'HEAD' ? null : publicPage(path, sharedCss), { headers });
+}
 
 /** Public surface: official 2026-07-28 SDK, no credentials, shared mutations or provider calls. */
-export async function handlePublicMcp(request: Request, appHtml: string): Promise<Response> {
+export async function handlePublicMcp(request: Request, appHtml: string, sharedCss = ''): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname !== '/mcp') return publicResponse(request, url.pathname, sharedCss);
   const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type,Accept,MCP-Protocol-Version,Mcp-Session-Id,Mcp-Method,Mcp-Name', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Expose-Headers': 'MCP-Protocol-Version' };
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-  if (url.pathname !== '/mcp') return new Response('こはる珈琲デモの公開MCP。架空データの読取・集計のみ。', { headers: { ...cors, 'Content-Type': 'text/plain; charset=utf-8' } });
   // Sites probes the supported revisions before adding MCP2's per-request
   // envelope. This narrow discovery compatibility path advertises the real
   // SDK2 implementation below; all tool/resource execution stays in the SDK.
@@ -47,4 +66,4 @@ export async function handlePublicMcp(request: Request, appHtml: string): Promis
   const headers = new Headers(response.headers); for (const [k,v] of Object.entries(cors)) headers.set(k,v);
   return new Response(response.body, { status: response.status, headers });
 }
-export default { fetch: (request: Request) => handlePublicMcp(request, KOHARU_UI_HTML) };
+export default { fetch: (request: Request) => handlePublicMcp(request, KOHARU_UI_HTML, KOHARU_PUBLIC_CSS) };

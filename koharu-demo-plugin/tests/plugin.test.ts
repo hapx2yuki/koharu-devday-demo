@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { OpenAIFileEntrypointInputSchema } from '@openai/mcp-extensions/app';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { createDemoServer, UI_URI } from '../src/server.js';
+import { createDemoServer, UI_URI, SAMPLE_CSV } from '../src/server.js';
 import { handlePublicMcp } from '../src/public-worker.js';
 import { summarizeDemoCsv } from '../src/csv.js';
 import type { MissionOrdersSnapshot } from '../src/order-types.js';
@@ -95,6 +96,80 @@ test('初期画面の後にファイル読取が完了しても、集計結果�
   assert.match(ui.root.find('csv-result')!.textContent!, /受付済み 2点 \/ ¥900/);
   await ui.renderAgain();
   assert.match(ui.root.find('csv-result')!.textContent!, /example.csv\n1行を確認\n受付済み 2点 \/ ¥900/);
+});
+
+test('公開ホームは共通スタイルと正式な操作・サポート・ソースの導線を返す', async () => {
+  const css = await readFile(new URL('../src/ui.css', import.meta.url), 'utf8');
+  const response = await handlePublicMcp(new Request('https://demo.example/'), '', css);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('Content-Type'), 'text/html; charset=utf-8');
+  assert.equal(response.headers.get('X-Content-Type-Options'), 'nosniff');
+  assert.match(response.headers.get('Content-Security-Policy')!, /default-src 'none'/);
+  const html = await response.text();
+  assert.ok(html.includes(css));
+  assert.match(html, /架空データ専用・実決済なし/);
+  assert.match(html, /公開ディレクトリへの掲載は準備中です。接続権限がある方はChatGPTで開けます。/);
+  assert.match(html, /https:\/\/chatgpt\.com\/plugins\/plugin_asdk_app_sites_1db06e9428108191bb778557411728a5/);
+  assert.match(html, /href="\/support"/);
+  assert.match(html, /href="\/example.csv" download="example.csv"/);
+  assert.match(html, /https:\/\/github\.com\/hapx2yuki\/koharu-devday-demo/);
+  assert.match(html, /Yuki Urata/);
+  assert.doesNotMatch(html, /<script|<iframe|<form/);
+});
+test('公開ページの3書体を同梱し、MCP AppのHTMLへは追加しない', async () => {
+  const { default: worker } = await import(new URL('../dist/worker.js', import.meta.url).href);
+  const response = await worker.fetch(new Request('https://demo.example/'));
+  assert.match(response.headers.get('Content-Security-Policy')!, /font-src data:/);
+  const html = await response.text();
+  const embedded = [...html.matchAll(/data:font\/ttf;base64,([A-Za-z0-9+/=]+)/g)];
+  const files = ['mplus2-regular-public.ttf', 'mplus2-bold-public.ttf', 'mplus1code-public.ttf'];
+  assert.equal(embedded.length, files.length);
+  for (let index = 0; index < files.length; index++) {
+    const data = Buffer.from(embedded[index]![1]!, 'base64');
+    assert.equal(data.readUInt32BE(0), 0x00010000);
+    assert.deepEqual(data, await readFile(new URL('../assets/fonts/' + files[index], import.meta.url)));
+  }
+  assert.match(html, /font-family:"M PLUS 2"/);
+  assert.match(html, /font-family:"M PLUS 1 Code"/);
+  assert.match(html, /SIL OPEN FONT LICENSE Version 1.1/);
+  assert.doesNotMatch(html, /url\(https?:/);
+  const appHtml = await readFile(new URL('../dist/ui.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(appHtml, /data:font\/ttf/);
+});
+test('サポートは実際の操作・CSV条件・公開窓口を案内する', async () => {
+  const response = await handlePublicMcp(new Request('https://demo.example/support'), '');
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /aria-current="page"/);
+  for (const text of ['試し注文を確定', '取り消す', '100KB', '2000行', 'pickup_number', 'product_id', 'quantity', 'unit_price_yen', 'status', 'confirmed', 'cancelled', '発生日時', 'エラー文']) assert.ok(html.includes(text), text);
+  assert.match(html, /mailto:hapx2yuki@gmail.com/);
+  assert.doesNotMatch(html, /24時間以内|翌営業日|privacyPolicyURL|termsOfServiceURL/);
+});
+test('公開CSVは既定の架空データと一致し、HEADも同じ種別で本文なしを返す', async () => {
+  const response = await handlePublicMcp(new Request('https://demo.example/example.csv'), '');
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('Content-Type'), 'text/csv; charset=utf-8');
+  assert.equal(response.headers.get('Content-Disposition'), 'attachment; filename="example.csv"');
+  const csv = await response.text();
+  assert.equal(csv, SAMPLE_CSV);
+  assert.deepEqual(summarizeDemoCsv(csv), { rows: 3, confirmedUnits: 3, confirmedTotalYen: 1450, cancelledRows: 1 });
+  for (const path of ['/', '/support', '/example.csv']) {
+    const head = await handlePublicMcp(new Request('https://demo.example' + path, { method: 'HEAD' }), '');
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), '');
+  }
+});
+test('公開ページへの書込要求と未定義URLを受け付けず、MCPのOPTIONSは維持する', async () => {
+  for (const path of ['/', '/support', '/example.csv']) {
+    const response = await handlePublicMcp(new Request('https://demo.example' + path, { method: 'POST', body: 'test' }), '');
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get('Allow'), 'GET, HEAD');
+  }
+  const missing = await handlePublicMcp(new Request('https://demo.example/privacy'), '');
+  assert.equal(missing.status, 404);
+  const options = await handlePublicMcp(new Request('https://demo.example/mcp', { method: 'OPTIONS' }), '');
+  assert.equal(options.status, 204);
+  assert.equal(options.headers.get('Access-Control-Allow-Methods'), 'GET,POST,OPTIONS');
 });
 
 async function setup(mode: 'local-demo' | 'public-readonly' = 'local-demo') {
