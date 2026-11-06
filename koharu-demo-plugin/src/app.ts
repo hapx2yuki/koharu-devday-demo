@@ -11,6 +11,7 @@ const root = document.getElementById('app')!;
 let mode = 'local-demo', connected = false;
 let snapshot: MissionOrdersSnapshot | undefined;
 let fileInput: { file: { name: string; resourceUri: string } } | undefined;
+let fileReadVersion = 0;
 let csvOutput = '選んだCSVはこの画面で検査します。サーバーへのアップロードや保存はしません。';
 let preview: MissionOrders | undefined;
 let pending: { requestId: string; slotId: string; items: { productId: string; quantity: number }[] } | undefined;
@@ -87,7 +88,17 @@ function render(): void {
   const csv = node('section', undefined, 'csv'); csv.append(node('h2', '架空注文CSVを確認'));
   const input = node('input'); input.type = 'file'; input.accept = '.csv,text/csv'; input.setAttribute('aria-label', 'こはる珈琲の架空注文CSV');
   const output = node('pre', csvOutput); output.id = 'csv-result'; output.setAttribute('role', 'status');
-  input.onchange = async () => { const file = input.files?.[0]; if (!file) return; if (file.size > 100_000) { showCsvOutput('CSVは100KB以内にしてください。'); return; } inspectCsv(await file.text(), file.name); }; csv.append(input, output); root.append(csv);
+  input.onchange = async () => {
+    const file = input.files?.[0]; if (!file) return;
+    const version = ++fileReadVersion;
+    if (file.size > 100_000) { showCsvOutput('CSVは100KB以内にしてください。'); return; }
+    try {
+      const content = await file.text();
+      if (version === fileReadVersion) inspectCsv(content, file.name);
+    } catch {
+      if (version === fileReadVersion) showCsvOutput('選んだCSVを読み取れませんでした。');
+    }
+  }; csv.append(input, output); root.append(csv);
 }
 function showCsvOutput(text: string): void {
   csvOutput = text;
@@ -101,14 +112,16 @@ async function readOpenedFile(): Promise<void> {
   if (!fileInput || !connected) return;
   if (!extensions.resources) { showCsvOutput('この実行画面は正式なファイル読取に対応していません。CSV選択から確認できます。'); return; }
   const { file } = fileInput; fileInput = undefined;
+  const version = fileReadVersion;
   try {
     const result = await extensions.resources.read({ uri: file.resourceUri }); const value = result.contents[0];
+    if (version !== fileReadVersion) return;
     if (value && ('text' in value ? value.text.length > 100_000 : 'blob' in value && value.blob.length > 140_000)) throw new Error('size');
     const text = value && 'text' in value ? value.text : value && 'blob' in value ? new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(value.blob), c => c.charCodeAt(0))) : '';
     inspectCsv(text, file.name);
-  } catch { showCsvOutput('正式ファイルの読取結果を取得できませんでした。'); }
+  } catch { if (version === fileReadVersion) showCsvOutput('正式ファイルの読取結果を取得できませんでした。'); }
 }
-app.addEventListener('toolinput', async ({ arguments: args }) => { const parsed = OpenAIFileEntrypointInputSchema.safeParse(args); if (parsed.success) { fileInput = parsed.data; await readOpenedFile(); } });
+app.addEventListener('toolinput', async ({ arguments: args }) => { const parsed = OpenAIFileEntrypointInputSchema.safeParse(args); if (parsed.success) { fileReadVersion++; fileInput = parsed.data; await readOpenedFile(); } });
 app.ontoolresult = async result => { await accept(result.structuredContent); await readOpenedFile(); };
 app.addEventListener('hostcontextchanged', context => { if (context.theme) applyDocumentTheme(context.theme); if (context.styles?.variables) applyHostStyleVariables(context.styles.variables); });
 if (root.dataset?.surface === 'browser') {

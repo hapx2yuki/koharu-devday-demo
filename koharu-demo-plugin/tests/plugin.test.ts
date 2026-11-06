@@ -49,7 +49,7 @@ async function setupApp(browser = false) {
   const snapshotRequested = deferred<void>();
   const initialSnapshot = deferred<unknown>();
   const fileRequested = deferred<void>();
-  const fileContents = deferred<unknown>();
+  const fileReads: ReturnType<typeof deferred<unknown>>[] = [];
   const handlers = new Map<string, (event: unknown) => Promise<void>>();
   let app!: TestApp;
   let connectionCalls = 0, serverCalls = 0;
@@ -62,7 +62,9 @@ async function setupApp(browser = false) {
     callServerTool() { serverCalls++; snapshotRequested.resolve(); return initialSnapshot.promise; }
   }
   class TestExtensions {
-    resources = { read: () => { fileRequested.resolve(); return fileContents.promise; } };
+    resources = { read: () => {
+      const result = deferred<unknown>(); fileReads.push(result); fileRequested.resolve(); return result.promise;
+    } };
   }
   const snapshot = { mode: 'local-demo', snapshot: { products: [], slots: [], orders: [], confirmedOrderCount: 0, confirmedTotalYen: 0 } };
   const boot = runInNewContext(`(async () => { ${await appBundle} })()`, {
@@ -73,8 +75,8 @@ async function setupApp(browser = false) {
   return {
     root, connection, snapshotRequested, fileRequested, boot,
     calls: () => ({connectionCalls, serverCalls}),
-    openFile: () => handlers.get('toolinput')!({ arguments: { file: { name: 'example.csv', resourceUri: 'file://example.csv' } } }),
-    finishFile: () => fileContents.resolve({ contents: [{ text: 'pickup_number,product_id,quantity,unit_price_yen,status\nK001,coffee,2,450,confirmed\n' }] }),
+    openFile: (name = 'example.csv') => handlers.get('toolinput')!({ arguments: { file: { name, resourceUri: 'host-resource://' + name } } }),
+    finishFile: (index = 0) => fileReads[index]!.resolve({ contents: [{ text: 'pickup_number,product_id,quantity,unit_price_yen,status\nK001,coffee,2,450,confirmed\n' }] }),
     finishSnapshot: () => initialSnapshot.resolve({ structuredContent: snapshot }),
     renderAgain: () => app.ontoolresult!({ structuredContent: snapshot }),
   };
@@ -131,6 +133,18 @@ test('初期画面の後にファイル読取が完了しても、集計結果�
   assert.match(ui.root.find('csv-result')!.textContent!, /example.csv\n1行を確認\n受付済み 2点 \/ ¥900/);
 });
 
+test('前に開いたファイルの遅い読取で最新ファイルの結果を上書きしない', async () => {
+  const ui = await setupApp();
+  ui.connection.resolve(); await ui.snapshotRequested.promise;
+  ui.finishSnapshot(); await ui.boot;
+  const first = ui.openFile('first.csv');
+  const second = ui.openFile('latest.csv');
+  ui.finishFile(1); await second;
+  assert.match(ui.root.find('csv-result')!.textContent!, /^latest\.csv\n/);
+  ui.finishFile(0); await first;
+  assert.match(ui.root.find('csv-result')!.textContent!, /^latest\.csv\n/);
+});
+
 test('公開ホームは共通スタイルと正式な操作・サポート・ソースの導線を返す', async () => {
   const css = await readFile(new URL('../src/ui.css', import.meta.url), 'utf8');
   const response = await handlePublicMcp(new Request('https://demo.example/'), '', css);
@@ -176,7 +190,102 @@ test('サポートは実際の操作・CSV条件・公開窓口を案内する',
   assert.match(html, /aria-current="page"/);
   for (const text of ['試し注文を確定', '取り消す', '100KB', '2000行', 'pickup_number', 'product_id', 'quantity', 'unit_price_yen', 'status', 'confirmed', 'cancelled', '発生日時', 'エラー文']) assert.ok(html.includes(text), text);
   assert.match(html, /mailto:hapx2yuki@gmail.com/);
+  assert.match(html, /問い合わせを閲覧するのはYuki Urata本人だけ/);
+  assert.match(html, /完了後90日を目安に削除/);
+  assert.match(html, /href="\/privacy"/);
+  assert.match(html, /href="\/terms"/);
   assert.doesNotMatch(html, /24時間以内|翌営業日|privacyPolicyURL|termsOfServiceURL/);
+});
+test('公開の方針と利用条件は承認済み運営条件と実際の処理範囲を返す', async () => {
+  const privacy = await handlePublicMcp(new Request('https://demo.example/privacy'), '');
+  const terms = await handlePublicMcp(new Request('https://demo.example/terms'), '');
+  assert.equal(privacy.status, 200);
+  assert.equal(terms.status, 200);
+  const privacyHtml = await privacy.text();
+  const termsHtml = await terms.text();
+  for (const html of [privacyHtml, termsHtml]) {
+    assert.match(html, /Yuki Urata/);
+    assert.match(html, /本ページの初回公開日/);
+    assert.match(html, /提供対象 日本/);
+    assert.match(html, /href="\/support"/);
+    assert.match(html, /aria-current="page"/);
+    assert.doesNotMatch(html, /未公開の草案|公開前に確定|<script|<iframe|<form/);
+  }
+  assert.match(privacyHtml, /閲覧するのは運営者のYuki Urata本人だけ/);
+  assert.match(privacyHtml, /対応完了後90日を目安に削除/);
+  assert.match(privacyHtml, /CSV本文が公開MCPへ渡り/);
+  assert.match(privacyHtml, /ログ項目や保存期間を、本デモの独自コードだけで確認・変更することはできません/);
+  assert.match(termsHtml, /画面の終了や再読込みで失われる場合/);
+  assert.match(termsHtml, /実店舗への予約、商品購入、決済、顧客への通知は行いません/);
+});
+test('審査用録画がない場合は動画と再生ページを公開しない', async () => {
+  for (const path of ['/demo-recording', '/demo-recording.mp4']) {
+    for (const method of ['GET', 'HEAD']) {
+      const response = await handlePublicMcp(new Request('https://demo.example' + path, { method }), '');
+      assert.equal(response.status, 404);
+      if (method === 'HEAD') assert.equal(await response.text(), '');
+    }
+  }
+});
+test('録画ページは標準の動画操作と同一サイトのMP4だけを許可する', async () => {
+  const recording = Uint8Array.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  const send = (method: string) => handlePublicMcp(new Request('https://demo.example/demo-recording', { method }), '', 'shared-style', undefined, recording);
+  const response = await send('GET');
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('Content-Type'), 'text/html; charset=utf-8');
+  assert.match(response.headers.get('Content-Security-Policy')!, /media-src 'self'/);
+  const html = await response.text();
+  assert.match(html, /<video controls playsinline preload="metadata"/);
+  assert.match(html, /src="\/demo-recording.mp4"/);
+  assert.match(html, /shared-style/);
+  assert.doesNotMatch(html, /autoplay|<iframe|<script/);
+  const head = await send('HEAD');
+  assert.equal(head.status, 200);
+  assert.equal(await head.text(), '');
+  const post = await send('POST');
+  assert.equal(post.status, 405);
+  assert.equal(post.headers.get('Allow'), 'GET, HEAD');
+});
+test('録画のGETとHEADは実バイト数を返し、範囲要求で既知のバイトだけを返す', async () => {
+  const recording = Uint8Array.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  const send = (headers: Record<string, string> = {}, method = 'GET') => handlePublicMcp(new Request('https://demo.example/demo-recording.mp4', { method, headers }), '', '', undefined, recording);
+  const full = await send();
+  assert.equal(full.status, 200);
+  assert.equal(full.headers.get('Content-Type'), 'video/mp4');
+  assert.equal(full.headers.get('Content-Length'), '10');
+  assert.equal(full.headers.get('Accept-Ranges'), 'bytes');
+  assert.equal(full.headers.get('X-Content-Type-Options'), 'nosniff');
+  assert.match(full.headers.get('Cache-Control')!, /no-transform/);
+  assert.deepEqual(new Uint8Array(await full.arrayBuffer()), recording);
+  const head = await send({ Range: 'bytes=2-4' }, 'HEAD');
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get('Content-Length'), '10');
+  assert.equal(head.headers.get('Content-Range'), null);
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+  for (const [range, contentRange, expected] of [
+    ['bytes=2-4', 'bytes 2-4/10', [2, 3, 4]],
+    ['bytes=7-', 'bytes 7-9/10', [7, 8, 9]],
+    ['bytes=-3', 'bytes 7-9/10', [7, 8, 9]],
+    ['bytes=8-100', 'bytes 8-9/10', [8, 9]],
+    ['bytes=-100', 'bytes 0-9/10', [...recording]],
+  ] as const) {
+    const response = await send({ Range: range });
+    assert.equal(response.status, 206, range);
+    assert.equal(response.headers.get('Content-Range'), contentRange, range);
+    assert.equal(response.headers.get('Content-Length'), String(expected.length), range);
+    assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], expected, range);
+  }
+  for (const range of ['bytes=10-', 'bytes=5-2', 'bytes=-0', 'bytes=-', 'bytes=0-1,4-5', 'items=0-1', 'bytes=9007199254740992-']) {
+    const response = await send({ Range: range });
+    assert.equal(response.status, 416, range);
+    assert.equal(response.headers.get('Content-Range'), 'bytes */10', range);
+    assert.equal(response.headers.get('Content-Length'), '0', range);
+    assert.equal((await response.arrayBuffer()).byteLength, 0, range);
+  }
+  const ifRange = await send({ Range: 'bytes=2-4', 'If-Range': '"unverified-version"' });
+  assert.equal(ifRange.status, 200);
+  assert.deepEqual(new Uint8Array(await ifRange.arrayBuffer()), recording);
+  assert.equal((await send({}, 'POST')).status, 405);
 });
 test('公開CSVは既定の架空データと一致し、HEADも同じ種別で本文なしを返す', async () => {
   const response = await handlePublicMcp(new Request('https://demo.example/example.csv'), '');
@@ -186,19 +295,19 @@ test('公開CSVは既定の架空データと一致し、HEADも同じ種別で�
   const csv = await response.text();
   assert.equal(csv, SAMPLE_CSV);
   assert.deepEqual(summarizeDemoCsv(csv), { rows: 3, confirmedUnits: 3, confirmedTotalYen: 1450, cancelledRows: 1 });
-  for (const path of ['/', '/support', '/example.csv']) {
+  for (const path of ['/', '/support', '/privacy', '/terms', '/example.csv']) {
     const head = await handlePublicMcp(new Request('https://demo.example' + path, { method: 'HEAD' }), '');
     assert.equal(head.status, 200);
     assert.equal(await head.text(), '');
   }
 });
 test('公開ページへの書込要求と未定義URLを受け付けず、MCPのOPTIONSは維持する', async () => {
-  for (const path of ['/', '/support', '/example.csv']) {
+  for (const path of ['/', '/support', '/privacy', '/terms', '/example.csv']) {
     const response = await handlePublicMcp(new Request('https://demo.example' + path, { method: 'POST', body: 'test' }), '');
     assert.equal(response.status, 405);
     assert.equal(response.headers.get('Allow'), 'GET, HEAD');
   }
-  const missing = await handlePublicMcp(new Request('https://demo.example/privacy'), '');
+  const missing = await handlePublicMcp(new Request('https://demo.example/unknown-page'), '');
   assert.equal(missing.status, 404);
   const options = await handlePublicMcp(new Request('https://demo.example/mcp', { method: 'OPTIONS' }), '');
   assert.equal(options.status, 204);
