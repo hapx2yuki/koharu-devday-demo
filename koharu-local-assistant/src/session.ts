@@ -10,6 +10,19 @@ function openBrowser(url: string): void {
 }
 const html = (body: string) => `<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>こはる珈琲 補助アプリ</title><body><main><h1>こはる珈琲 補助アプリ</h1>${body}</main></body></html>`;
 
+type SignInStage = 'callback' | 'exchange' | 'keychain' | 'host';
+function signInFailure(error: unknown, stage: SignInStage) {
+  const titles: Record<SignInStage, string> = {
+    callback: '認証の戻り値を確認できませんでした。',
+    exchange: 'ChatGPTの認証応答を確認できませんでした。',
+    keychain: 'ChatGPTから受け取った認証情報を、このMacに保存できませんでした。',
+    host: 'このMacで使用するアカウント設定を保存できませんでした。',
+  };
+  const detail = error instanceof SafeError ? error.message : '補助アプリの処理でエラーが発生しました。';
+  const escape = (text: string) => text.replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]!));
+  return {error: new SafeError(`${titles[stage]} ${detail}`), page: html(`<section role="alert"><h2>${titles[stage]}</h2><p>${escape(detail)}</p><p>補助アプリの表示を確認してください。</p></section>`)};
+}
+
 export interface SignInDependencies {
   readHost?: typeof hostConfig;
   writeHost?: typeof saveHost;
@@ -68,26 +81,31 @@ export async function signIn(plan: boolean, addAccount = false, dependencies: Si
     try {
       callback = consumeCallback(current, url);
     } catch (e) {
-      res.writeHead(400).end(html('<p>認証を確認できませんでした。補助アプリからやり直してください。</p>'));
-      if (current.consumed) stop(e instanceof SafeError ? e : new SafeError('認証処理に失敗しました。'));
+      const failure = signInFailure(e, 'callback');
+      res.writeHead(400).end(failure.page);
+      if (current.consumed) stop(failure.error);
       return;
     }
     clearTimeout(timeout);
     activeCallback = (async () => {
+      let stage: SignInStage = 'exchange';
       try {
         const credential = await exchange(current, callback, cancellation.signal);
         if (settled || cancellation.signal.aborted || pending !== current) {
           res.writeHead(400).end(html('<p>認証待機は終了しました。</p>')); return;
         }
         // Once persistence starts, finish both writes before releasing the process lock.
+        stage = 'keychain';
         await saveCredential(credential);
         if (!config.accounts.some(a => a.clientId === credential.clientId)) config.accounts.push({ clientId: credential.clientId, subject: credential.subject });
+        stage = 'host';
         config.active = credential.clientId; await writeHost(config);
         res.end(html('<p>認証を保存しました。この画面を閉じて補助アプリへ戻れます。</p>'));
         if (!settled) { settled = true; done(); }
       } catch (e) {
-        res.writeHead(400).end(html('<p>認証を確認できませんでした。補助アプリからやり直してください。</p>'));
-        stop(e instanceof SafeError ? e : new SafeError('認証処理に失敗しました。'));
+        const failure = signInFailure(e, stage);
+        res.writeHead(stage === 'keychain' || stage === 'host' ? 500 : 400).end(failure.page);
+        stop(failure.error);
       }
     })();
     await activeCallback;

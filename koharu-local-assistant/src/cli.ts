@@ -1,4 +1,4 @@
-import { KeychainStore, exclusively, hostConfig, saveHost } from './keychain.js';
+import { KeychainStore, ensureKeychainHelper, exclusively, hostConfig, saveHost } from './keychain.js';
 import { SafeError } from './protocol.js';
 import { availableModels, createSyntheticPlan } from './requests.js';
 import { refreshed, selectedCredential, signIn, signOut } from './session.js';
@@ -35,7 +35,10 @@ try {
     if (!selected || !c.accounts.some(a => a.clientId === selected)) throw new SafeError('accountsにある登録IDを指定してください。');
     c.active = selected; await saveHost(c); console.log('使用する登録を変更しました。未接続の場合はsigninを実行してください。');
   });
-  else if (command === 'signin') await exclusively(() => signIn(flag('--plan'), flag('--add-account')));
+  else if (command === 'signin') await exclusively(async () => {
+    await ensureKeychainHelper();
+    await signIn(flag('--plan'), flag('--add-account'));
+  });
   else if (command === 'signout') await exclusively(() => signOut(new KeychainStore()));
   else if (command === 'models' || command === 'plan') await exclusively(async () => {
     // Check confirmation before refreshing credentials or making any inference request.

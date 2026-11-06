@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { SignJWT, generateKeyPair, exportJWK, createLocalJWKSet } from 'jose';
-import { authorizationUrl, consumeCallback, createPending, beginPending, exchangeCode, validateTokens, PLAN_SCOPES, ISSUER, type Credential } from '../src/protocol.js';
+import { authorizationUrl, consumeCallback, createPending, beginPending, exchangeCode, validateTokens, PLAN_SCOPES, ISSUER, SafeError, type Credential } from '../src/protocol.js';
 import { KeychainStore } from '../src/keychain.js';
 import { createSyntheticPlan } from '../src/requests.js';
 import { signIn, type SignInDependencies } from '../src/session.js';
@@ -194,7 +194,7 @@ test('Keychainへの書込みはstdinだけに秘密を渡し、保存値を再�
   let stored = ''; let writes = 0;
   const store = new KeychainStore(async (args, input) => {
     assert.ok(!JSON.stringify(args).includes(credential.accessToken!)); assert.ok(!JSON.stringify(args).includes(credential.refreshToken!));
-    if (args[0] === '-i') { assert.ok(input); stored = input.match(/ -w ([A-Za-z0-9+/=]+)\n$/)![1]!; writes++; return { code: 0, output: '' }; }
+    if (args[0] === 'set') { assert.ok(input); stored = input; writes++; return { code: 0, output: '' }; }
     return { code: 0, output: stored + '\n' };
   });
   await store.save(credential); assert.equal(writes, 1); assert.deepEqual(await store.load(clientId), credential);
@@ -202,7 +202,7 @@ test('Keychainへの書込みはstdinだけに秘密を渡し、保存値を再�
 
 test('Keychainの成功応答だけでは保存成功とせず、以前の値を検出する', async () => {
   const old = Buffer.from(JSON.stringify({ ...credential, accessToken: 'old-token' })).toString('base64');
-  const store = new KeychainStore(async args => ({ code: 0, output: args[0] === '-i' ? '' : old }));
+  const store = new KeychainStore(async args => ({ code: 0, output: args[0] === 'set' ? '' : old }));
   await assert.rejects(store.save(credential), /保存を再確認/);
 });
 
@@ -227,4 +227,17 @@ test('正式completed・visible text・利用量だけを返す', async () => {
   ].map(e => 'data: ' + JSON.stringify(e) + '\n\n').join(''));
   const result = await createSyntheticPlan(credential, { model: 'gpt-6.1-sol', confirmedPlanLimit: true, creditsDisabled: true }, fetcher);
   assert.equal(result.text, '受注できます。'); assert.equal(result.inputTokens, 10); assert.ok(!JSON.stringify(result).includes('nonpublic'));
+});
+
+
+test('保存失敗は認証交換の失敗と区別し、安全な説明を表示する', async () => {
+  const session = localSignIn({exchange: async () => credential, saveCredential: async () => {throw new SafeError('キーチェーンに保存できませんでした（OSStatus -25293）。');}});
+  const response = await fetch(await startCallback(await session.ready));
+  assert.equal(response.status, 500);
+  const body = await response.text();
+  assert.match(body, /ChatGPTから受け取った認証情報を、このMacに保存できませんでした/);
+  assert.match(body, /OSStatus -25293/);
+  for (const secret of [credential.accessToken!, credential.refreshToken!, credential.idToken]) assert.ok(!body.includes(secret));
+  assert.match((await session.result).error!.message, /このMacに保存/);
+  assert.equal(session.hostWrites.length, 0);
 });
